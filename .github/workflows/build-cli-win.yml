@@ -1,0 +1,164 @@
+name: Build concat-cli (Windows x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ORT_VERSION: 1.28.0
+  GGML_NATIVE: "OFF"
+  GGML_BACKEND_DL: "ON"
+  GGML_CPU_ALL_VARIANTS: "ON"
+  GGML_AVX2: "OFF"
+  GGML_FMA: "OFF"
+  GGML_F16C: "OFF"
+  GGML_BMI2: "OFF"
+
+jobs:
+  build-win64:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' src/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Apply Simplified Chinese Whisper patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $file = "src/crates/concat-speech/src/transcribe.rs"
+          $content = Get-Content -Raw -Encoding UTF8 $file
+          if ($content -notmatch "以下是普通话的句子。") {
+            $target = "params.set_language(Some(language));"
+            if (-not $content.Contains($target)) {
+              throw "Could not find target line in $file"
+            }
+            $replacement = @"
+          params.set_language(Some(language));
+                  if language == "zh" {
+                      params.set_initial_prompt("以下是普通话的句子。");
+                  }
+          "@
+            $content = $content.Replace($target, $replacement)
+            [System.IO.File]::WriteAllText((Resolve-Path $file), $content, (New-Object System.Text.UTF8Encoding $false))
+            Write-Host "Applied Simplified Chinese Whisper prompt patch."
+          } else {
+            Write-Host "Patch already present, skipping."
+          }
+
+      - name: Install LLVM and FFmpeg (Windows)
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          & $bash scripts/ci/fetch.sh llvm-win64 llvm.exe
+          if ($LASTEXITCODE -ne 0) { throw "LLVM download failed" }
+          Start-Process -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\llvm"
+          if (-not (Test-Path C:\llvm\bin\libclang.dll)) { throw "LLVM did not install to C:\llvm" }
+          Remove-Item llvm.exe -ErrorAction SilentlyContinue
+          "C:\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          & $bash scripts/ci/fetch.sh ffmpeg-win64 ffmpeg-win.zip
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg download failed" }
+          Expand-Archive ffmpeg-win.zip -DestinationPath ffdl
+          $dir = (Get-ChildItem ffdl -Directory | Select-Object -First 1).FullName
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install ONNX Runtime (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/onnxruntime.sh win-x64
+          if ($LASTEXITCODE -ne 0) { throw "ONNX Runtime download failed" }
+          $dir = "$PWD\onnxruntime-win-x64-$env:ORT_VERSION"
+          if (-not (Test-Path "$dir\lib\onnxruntime.lib")) { throw "onnxruntime.lib missing" }
+          "ORT_LIB_LOCATION=$dir\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\lib" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          key: concat-cli-win64
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST GGML ORT
+
+      - name: Build concat-cli.exe
+        timeout-minutes: 60
+        shell: bash
+        working-directory: src
+        run: |
+          set -o pipefail
+          cargo build --profile app -p concat-cli --target x86_64-pc-windows-msvc 2>&1 | tee build-cli.log
+
+      - name: Stage portable Windows bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "stage\concat-cli-windows-x64"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+
+          Copy-Item "src\target\x86_64-pc-windows-msvc\app\concat-cli.exe" $dir
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dir
+          Copy-Item "$env:FFMPEG_DIR\bin\ffmpeg.exe", "$env:FFMPEG_DIR\bin\ffprobe.exe" $dir -ErrorAction SilentlyContinue
+          Copy-Item "$env:ORT_DIR\lib\*.dll" $dir
+
+          $built = Get-ChildItem "src\target\x86_64-pc-windows-msvc\app\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($built) {
+            Copy-Item "$($built.DirectoryName)\whisper.dll", "$($built.DirectoryName)\ggml*.dll" $dir
+          }
+
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $dir -ErrorAction SilentlyContinue
+
+          # Bundle Visual C++ runtime DLLs so it runs on a brand-new Windows PC
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find "VC\Tools\MSVC\**\bin\Host*\*\dumpbin.exe" | Select-Object -First 1
+          if ($crt -and $dumpbin) {
+            foreach ($pass in 1, 2) {
+              foreach ($pe in Get-ChildItem $dir -File -Include *.exe, *.dll -Recurse) {
+                foreach ($line in & $dumpbin /nologo /dependents $pe.FullName) {
+                  $dll = $line.Trim()
+                  if ($dll -match "\.dll$" -and (Test-Path "$($crt.FullName)\$dll") -and -not (Test-Path "$dir\$dll")) {
+                    Copy-Item "$($crt.FullName)\$dll" $dir
+                  }
+                }
+              }
+            }
+          }
+
+          Get-ChildItem $dir | Format-Table Name, Length
+
+      - name: Smoke test concat-cli.exe api
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $req = '{"jsonrpc":"2.0","id":1,"method":"catalogue.list","params":{}}'
+          $resp = $req | & ".\stage\concat-cli-windows-x64\concat-cli.exe" api
+          if ($LASTEXITCODE -ne 0) { throw "concat-cli.exe api exited with $LASTEXITCODE" }
+          if (-not ($resp -match '"result"')) { throw "Unexpected response: $resp" }
+          Write-Host "Smoke test passed! JSON-RPC catalogue.list responded cleanly."
+
+      - name: Upload portable bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: concat-cli-windows-x64
+          path: stage/concat-cli-windows-x64
+          retention-days: 30
